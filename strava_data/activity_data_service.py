@@ -4,14 +4,55 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
+from enum import Enum
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, TypeVar
 
+import requests
 from stravalib.client import Client
+from stravalib.exc import Fault, RateLimitExceeded, RateLimitTimeout
 from stravalib.model import Activity
 
 from strava_data.auth_service import StravaAuthService
+
+T = TypeVar("T")
+
+# Strava caps list endpoints at 200 rows per request; larger "limits" imply extra pages
+# (multiple HTTP calls) inside one stravalib iterator materialization.
+STRAVA_MAX_ACTIVITY_PAGE = 200
+
+
+class ApiQuotaExceeded(Exception):
+    """Raised when Strava signals rate limiting or the caller's request budget is exhausted."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class _RateLimitWindow:
+    short_limit: int | None
+    daily_limit: int | None
+    short_usage: int | None
+    daily_usage: int | None
+
+    @property
+    def short_exhausted(self) -> bool:
+        return (
+            self.short_limit is not None
+            and self.short_usage is not None
+            and self.short_usage >= self.short_limit
+        )
+
+    @property
+    def daily_exhausted(self) -> bool:
+        return (
+            self.daily_limit is not None
+            and self.daily_usage is not None
+            and self.daily_usage >= self.daily_limit
+        )
 
 
 def _quantity_num(value: Any) -> float | None:
@@ -93,6 +134,7 @@ class ActivityRecord:
     map_summary_polyline: str | None = None
     fetched_detail: bool = False
     weather_conditions: str | None = None
+    source_filename: str | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -103,6 +145,9 @@ class ActivityDataService:
 
     METERS_PER_MILE = 1609.344
     FEET_PER_METER = 3.28084
+    MAX_RETRIES = 5
+    RETRY_BASE_SECONDS = 2.0
+    RETRY_MAX_SECONDS = 120.0
 
     def __init__(
         self,
@@ -111,6 +156,178 @@ class ActivityDataService:
     ) -> None:
         self._auth = auth or StravaAuthService()
         self._client = client
+        self._max_api_requests: int | None = None
+        self._api_requests_used: int = 0
+        self._sync_stop_reason: str | None = None
+
+    def _is_retryable_error(self, exc: Exception) -> bool:
+        if isinstance(
+            exc,
+            (
+                RateLimitExceeded,
+                RateLimitTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            ),
+        ):
+            return True
+        return isinstance(exc, requests.exceptions.RequestException)
+
+    def _can_make_request(self) -> bool:
+        if self._max_api_requests is None:
+            return True
+        return self._api_requests_used < self._max_api_requests
+
+    def _wait_for_retry(self, operation: str, exc: Exception, attempt: int) -> None:
+        retry_after = getattr(exc, "timeout", None)
+        backoff = min(
+            self.RETRY_MAX_SECONDS,
+            self.RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+        )
+        wait_s = max(float(retry_after), backoff) if retry_after else backoff
+        # Small jitter helps avoid synchronized retries if multiple requests fail together.
+        wait_s += random.uniform(0.0, 0.5)
+        print(
+            f"{operation} failed ({type(exc).__name__}); "
+            f"retrying in {wait_s:.1f}s [{attempt}/{self.MAX_RETRIES}]"
+        )
+        time.sleep(wait_s)
+
+    @staticmethod
+    def _parse_rate_limit_pair(value: str | None) -> tuple[int | None, int | None]:
+        if not value:
+            return (None, None)
+        parts = [part.strip() for part in value.split(",", maxsplit=1)]
+        if len(parts) != 2:
+            return (None, None)
+        try:
+            return (int(parts[0]), int(parts[1]))
+        except ValueError:
+            return (None, None)
+
+    @classmethod
+    def _extract_rate_limit_windows(cls, response: Any) -> list[_RateLimitWindow]:
+        headers = getattr(response, "headers", None) or {}
+        windows: list[_RateLimitWindow] = []
+        for prefix in ("X-ReadRateLimit", "X-RateLimit"):
+            short_limit, daily_limit = cls._parse_rate_limit_pair(
+                headers.get(f"{prefix}-Limit")
+            )
+            short_usage, daily_usage = cls._parse_rate_limit_pair(
+                headers.get(f"{prefix}-Usage")
+            )
+            if any(
+                value is not None
+                for value in (short_limit, daily_limit, short_usage, daily_usage)
+            ):
+                windows.append(
+                    _RateLimitWindow(
+                        short_limit=short_limit,
+                        daily_limit=daily_limit,
+                        short_usage=short_usage,
+                        daily_usage=daily_usage,
+                    )
+                )
+        return windows
+
+    @staticmethod
+    def _seconds_until_next_quarter_hour(now: datetime | None = None) -> float:
+        now = now or datetime.now(timezone.utc)
+        next_minute = ((now.minute // 15) + 1) * 15
+        if next_minute >= 60:
+            reset_at = now.replace(minute=0, second=0, microsecond=0) + timedelta(
+                hours=1
+            )
+        else:
+            reset_at = now.replace(
+                minute=next_minute,
+                second=0,
+                microsecond=0,
+            )
+        return max((reset_at - now).total_seconds(), 1.0)
+
+    def _wait_for_short_rate_limit(self, operation: str, response: Any, attempt: int) -> None:
+        windows = self._extract_rate_limit_windows(response)
+        read_window = next(
+            (
+                window
+                for window in windows
+                if window.short_exhausted or window.daily_exhausted
+            ),
+            None,
+        )
+        wait_s = self._seconds_until_next_quarter_hour() + random.uniform(0.0, 1.0)
+        detail = ""
+        if read_window and read_window.short_limit is not None and read_window.short_usage is not None:
+            detail = f" ({read_window.short_usage}/{read_window.short_limit} short-term requests used)"
+        print(
+            f"{operation} hit Strava's 15-minute rate limit{detail}; "
+            f"waiting {wait_s:.1f}s for the next window [{attempt}/{self.MAX_RETRIES}]"
+        )
+        time.sleep(wait_s)
+
+    def _call_with_retries(self, operation: str, fn: Callable[[], T]) -> T:
+        if not self._can_make_request():
+            raise ApiQuotaExceeded(
+                "Request budget exhausted (max_api_requests); partial results were saved."
+            )
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                result = fn()
+            except Fault as exc:
+                resp = getattr(exc, "response", None)
+                if resp is not None and resp.status_code == 429:
+                    windows = self._extract_rate_limit_windows(resp)
+                    if any(window.daily_exhausted for window in windows):
+                        raise ApiQuotaExceeded(
+                            "Strava daily rate limit exhausted; partial results were saved."
+                        ) from exc
+                    if attempt >= self.MAX_RETRIES:
+                        raise ApiQuotaExceeded(
+                            "Strava short-term rate limit kept triggering; partial results were saved."
+                        ) from exc
+                    self._wait_for_short_rate_limit(operation, resp, attempt)
+                    continue
+                raise
+            except ApiQuotaExceeded:
+                raise
+            except Exception as exc:
+                if not self._is_retryable_error(exc) or attempt >= self.MAX_RETRIES:
+                    raise
+                self._wait_for_retry(operation, exc, attempt)
+                continue
+            self._api_requests_used += 1
+            return result
+        raise RuntimeError(f"Unreachable retry loop for operation: {operation}")
+
+    def _fetch_activity_batch(
+        self, before: datetime | None, batch_size: int
+    ) -> list[Activity]:
+        page_limit = min(batch_size, STRAVA_MAX_ACTIVITY_PAGE)
+
+        def _fetch() -> list[Activity]:
+            iterator = self.client.get_activities(before=before, limit=page_limit)
+            return list(iterator)
+
+        return self._call_with_retries("Fetch activity summaries", _fetch)
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        """Best-effort serializer for non-primitive values returned by stravalib."""
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc).isoformat()
+            return value.astimezone(timezone.utc).isoformat()
+        if isinstance(value, timedelta):
+            return value.total_seconds()
+        if isinstance(value, Enum):
+            return value.value
+        if hasattr(value, "num"):
+            return float(value.num)
+        if hasattr(value, "root"):
+            return str(value.root)
+        return str(value)
 
     @property
     def client(self) -> Client:
@@ -121,19 +338,52 @@ class ActivityDataService:
     def iter_all_activity_summaries(self, batch_size: int = 200) -> Iterator[Activity]:
         """Oldest-to-newest iterator over every activity in the token's history."""
         before: datetime | None = None
+        page_limit = min(batch_size, STRAVA_MAX_ACTIVITY_PAGE)
         while True:
-            batch: list[Activity] = []
-            iterator = self.client.get_activities(before=before, limit=batch_size)
-            for activity in iterator:
-                batch.append(activity)
+            if not self._can_make_request():
+                self._sync_stop_reason = (
+                    self._sync_stop_reason or "request budget exhausted (list fetch)"
+                )
+                return
+            try:
+                batch = self._fetch_activity_batch(before, batch_size)
+            except ApiQuotaExceeded as exc:
+                self._sync_stop_reason = self._sync_stop_reason or str(exc)
+                return
             if not batch:
                 break
             batch.reverse()
             for activity in batch:
                 yield activity
-            if len(batch) < batch_size:
+            if len(batch) < page_limit:
                 break
             oldest = batch[0].start_date
+            if oldest is None:
+                break
+            before = oldest - timedelta(seconds=1)
+
+    def iter_recent_activity_summaries(self, batch_size: int = 200) -> Iterator[Activity]:
+        """Newest-first iterator (see :meth:`Client.get_activities`); stops when history ends."""
+        before: datetime | None = None
+        page_limit = min(batch_size, STRAVA_MAX_ACTIVITY_PAGE)
+        while True:
+            if not self._can_make_request():
+                self._sync_stop_reason = (
+                    self._sync_stop_reason or "request budget exhausted (list fetch)"
+                )
+                return
+            try:
+                batch = self._fetch_activity_batch(before, batch_size)
+            except ApiQuotaExceeded as exc:
+                self._sync_stop_reason = self._sync_stop_reason or str(exc)
+                return
+            if not batch:
+                break
+            for activity in batch:
+                yield activity
+            if len(batch) < page_limit:
+                break
+            oldest = batch[-1].start_date
             if oldest is None:
                 break
             before = oldest - timedelta(seconds=1)
@@ -148,7 +398,12 @@ class ActivityDataService:
         detail = activity
         got_detail = False
         if fetch_detail and activity.id is not None:
-            detail = self.client.get_activity(activity.id, include_all_efforts=False)
+            detail = self._call_with_retries(
+                f"Fetch activity detail {activity.id}",
+                lambda: self.client.get_activity(
+                    activity.id, include_all_efforts=False
+                ),
+            )
             got_detail = True
 
         distance_m = _quantity_num(detail.distance)
@@ -187,7 +442,7 @@ class ActivityDataService:
             type=_type_label(detail.type),
             start_date=start_date_s,
             start_date_local=start_local_s,
-            timezone=detail.timezone,
+            timezone=_type_label(detail.timezone),
             utc_offset=detail.utc_offset,
             distance_m=distance_m,
             distance_mi=distance_mi,
@@ -237,8 +492,8 @@ class ActivityDataService:
             weather_conditions=None,
         )
 
+    @staticmethod
     def save_records_jsonl(
-        self,
         records: list[ActivityRecord],
         path: str,
     ) -> None:
@@ -247,7 +502,14 @@ class ActivityDataService:
             os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             for rec in records:
-                f.write(json.dumps(rec.to_json_dict(), ensure_ascii=False) + "\n")
+                f.write(
+                    json.dumps(
+                        rec.to_json_dict(),
+                        ensure_ascii=False,
+                        default=ActivityDataService._json_default,
+                    )
+                    + "\n"
+                )
 
     def collect_all_records(
         self,
@@ -255,26 +517,57 @@ class ActivityDataService:
         include_map_polyline: bool = False,
         fetch_detail: bool = True,
         activity_filter: str | None = None,
+        max_records: int | None = None,
+        max_api_requests: int | None = None,
+        recent_only: bool = False,
     ) -> list[ActivityRecord]:
         """
         Pull the complete activity history.
 
         ``activity_filter`` may be ``\"Run\"`` to only persist runs (checks ``type`` / ``sport_type``).
+
+        ``recent_only`` uses newest-first ordering (best match for "latest N activities").
+
+        ``max_api_requests`` caps successful HTTP calls (list pages + per-activity detail fetches).
         """
+        self._sync_stop_reason = None
+        self._max_api_requests = max_api_requests
+        self._api_requests_used = 0
         records: list[ActivityRecord] = []
-        for summary in self.iter_all_activity_summaries():
-            if activity_filter:
-                st = _type_label(summary.sport_type)
-                tp = _type_label(summary.type)
-                if st != activity_filter and tp != activity_filter:
-                    continue
-            records.append(
-                self.activity_to_record(
-                    summary,
-                    include_map_polyline=include_map_polyline,
-                    fetch_detail=fetch_detail,
-                )
-            )
+        iterator = (
+            self.iter_recent_activity_summaries()
+            if recent_only
+            else self.iter_all_activity_summaries()
+        )
+        try:
+            for summary in iterator:
+                if activity_filter:
+                    st = _type_label(summary.sport_type)
+                    tp = _type_label(summary.type)
+                    if st != activity_filter and tp != activity_filter:
+                        continue
+                if fetch_detail and summary.id is not None:
+                    if not self._can_make_request():
+                        self._sync_stop_reason = (
+                            self._sync_stop_reason
+                            or "request budget exhausted before detail fetch"
+                        )
+                        break
+                try:
+                    records.append(
+                        self.activity_to_record(
+                            summary,
+                            include_map_polyline=include_map_polyline,
+                            fetch_detail=fetch_detail,
+                        )
+                    )
+                except ApiQuotaExceeded as exc:
+                    self._sync_stop_reason = self._sync_stop_reason or str(exc)
+                    break
+                if max_records is not None and len(records) >= max_records:
+                    break
+        finally:
+            self._max_api_requests = None
         return records
 
     def collect_all_to_jsonl(
@@ -284,12 +577,18 @@ class ActivityDataService:
         include_map_polyline: bool = False,
         fetch_detail: bool = True,
         activity_filter: str | None = None,
+        max_records: int | None = None,
+        max_api_requests: int | None = None,
+        recent_only: bool = False,
     ) -> int:
-        """Pull the complete activity history and write one JSON object per line."""
+        """Pull activities and write one JSON object per line (partial write on quota stop)."""
         records = self.collect_all_records(
             include_map_polyline=include_map_polyline,
             fetch_detail=fetch_detail,
             activity_filter=activity_filter,
+            max_records=max_records,
+            max_api_requests=max_api_requests,
+            recent_only=recent_only,
         )
         self.save_records_jsonl(records, output_path)
         return len(records)

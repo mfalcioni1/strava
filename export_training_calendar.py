@@ -57,6 +57,15 @@ def _merge_day_cells(values: list[str]) -> str:
     return "\n".join(parts)
 
 
+def _weather_label(rec: ActivityRecord) -> str:
+    if rec.weather_conditions and rec.weather_conditions.strip():
+        return rec.weather_conditions.strip()
+    if rec.average_temp is not None:
+        temp_f = (rec.average_temp * 9.0 / 5.0) + 32.0
+        return f"{temp_f:.0f} F"
+    return ""
+
+
 @dataclass
 class DayBucket:
     miles: list[str] = field(default_factory=list)
@@ -81,8 +90,9 @@ class DayBucket:
         self.paces.append(_pace_mmss(rec.average_pace_min_per_mi))
         if rec.total_elevation_gain_ft is not None:
             self.elevs.append(f"{rec.total_elevation_gain_ft:.0f}")
-        if rec.weather_conditions:
-            self.weather.append(rec.weather_conditions)
+        weather = _weather_label(rec)
+        if weather:
+            self.weather.append(weather)
         eff = _relative_effort(rec)
         if eff:
             self.efforts.append(eff)

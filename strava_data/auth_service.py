@@ -13,7 +13,10 @@ class StravaAuthService:
         self.env_path = env_path or os.path.join(root, ".env")
         load_dotenv(dotenv_path=self.env_path)
 
-        self.client = Client()
+        # Avoid stravalib's DefaultRateLimiter, which can sleep until the next UTC day
+        # when the long-term quota is hit (appears as a hang). We handle limits in
+        # ActivityDataService (budget + graceful partial writes).
+        self.client = Client(rate_limit_requests=False)
         self.client_id = os.getenv("STRAVA_CLIENT_ID")
         self.client_secret = os.getenv("STRAVA_CLIENT_SECRET")
 
