@@ -59,6 +59,9 @@ _TRAINER_SPORTS = {"VirtualRide", "VirtualRun", "VirtualRow"}
 class BulkExportService:
     """Reads Strava's official bulk archive and writes the same JSONL as the API sync."""
 
+    def __init__(self, default_timezone: str | None = None) -> None:
+        self.default_timezone = default_timezone
+
     def load_records(
         self,
         source: str | Path,
@@ -75,7 +78,7 @@ class BulkExportService:
 
         records: list[ActivityRecord] = []
         for _, row in df.iterrows():
-            rec = row_to_record(row)
+            rec = row_to_record(row, self.default_timezone)
             if rec is None:
                 continue
             if activity_filter and not _matches_filter(rec, activity_filter):
@@ -149,7 +152,13 @@ class BulkExportService:
         )
 
 
-def row_to_record(row: pd.Series) -> ActivityRecord | None:
+def row_to_record(
+    row: pd.Series, default_timezone: str | None = None
+) -> ActivityRecord | None:
+    """
+    ``default_timezone`` (IANA name) converts ``Activity Date`` to local time for exports
+    without a ``Timezone`` column; in those exports the date is UTC.
+    """
     activity_id = _int(_value(row, "Activity ID", "id"))
     if activity_id is None:
         return None
@@ -177,6 +186,10 @@ def row_to_record(row: pd.Series) -> ActivityRecord | None:
     local_dt, tz_name, utc_offset, start_utc = _parse_start(row)
     if local_dt is not None and start_utc is None and tz_name:
         start_utc, utc_offset = _utc_from_zoneinfo(local_dt, tz_name, utc_offset)
+    elif local_dt is not None and start_utc is None:
+        local_dt, tz_name, utc_offset, start_utc = _local_from_utc(
+            local_dt, default_timezone
+        )
     filename = _str(_value(row, "Filename"))
     commute = _bool(_value(row, _COMMUTE_COL, "Commute"))
 
@@ -333,6 +346,31 @@ def _utc_from_zoneinfo(
     return start_utc, utc_offset
 
 
+def _local_from_utc(
+    utc_dt: datetime, tz_name: str | None
+) -> tuple[datetime, str, float, str]:
+    """``(local naive datetime, timezone name, utc offset seconds, UTC ISO string)``."""
+    from zoneinfo import ZoneInfo
+
+    aware_utc = utc_dt.replace(tzinfo=timezone.utc)
+    zone = None
+    if tz_name:
+        try:
+            zone = ZoneInfo(tz_name)
+        except Exception:
+            zone = None
+    if zone is None:
+        return utc_dt, "UTC", 0.0, aware_utc.isoformat()
+    local = aware_utc.astimezone(zone)
+    offset = local.utcoffset()
+    return (
+        local.replace(tzinfo=None),
+        tz_name,
+        offset.total_seconds() if offset is not None else 0.0,
+        aware_utc.isoformat(),
+    )
+
+
 def _sport_and_type(label: str | None) -> tuple[str | None, str | None]:
     if not label:
         return None, None
@@ -344,7 +382,8 @@ def _sport_and_type(label: str | None) -> tuple[str | None, str | None]:
 def _weather_label(row: pd.Series) -> str | None:
     bits: list[str] = []
     condition = _str(_value(row, "Weather Condition"))
-    if condition:
+    # Current exports store an undocumented numeric code here instead of text
+    if condition and _float(condition) is None:
         bits.append(condition)
     temp_c = _float(_value(row, "Weather Temperature"))
     if temp_c is not None:

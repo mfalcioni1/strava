@@ -164,7 +164,7 @@ def build_calendar_rows(
         date_row = ["Date"]
         for i in range(7):
             d = wk + timedelta(days=i)
-            date_row.append(d.strftime("%d-%b"))
+            date_row.append(d.strftime("%d-%b-%Y"))
         all_rows.append(date_row)
 
         metric_specs = [

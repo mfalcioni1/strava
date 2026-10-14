@@ -84,6 +84,29 @@ class BulkExportTests(unittest.TestCase):
             line = out.read_text(encoding="utf-8").strip()
             self.assertIn('"id": 123', line)
 
+    def test_export_without_timezone_column_treats_date_as_utc(self) -> None:
+        csv = (
+            "Activity ID,Activity Date,Activity Name,Activity Type,Distance,"
+            "Weather Condition,Weather Temperature\n"
+            '19949410908,"Aug 29, 2026, 1:10:13 AM",Late,Run,8.0,1.0,13.0\n'
+        )
+        df = pd.read_csv(StringIO(csv))
+        rec = row_to_record(df.iloc[0], "America/New_York")
+        assert rec is not None
+        self.assertEqual(rec.start_date, "2026-08-29T01:10:13+00:00")
+        self.assertEqual(rec.start_date_local, "2026-08-28T21:10:13")
+        self.assertEqual(rec.timezone, "America/New_York")
+        self.assertEqual(rec.utc_offset, -14400.0)
+        self.assertEqual(rec.weather_conditions, "55 F")
+
+    def test_export_without_timezone_falls_back_to_utc(self) -> None:
+        csv = 'Activity ID,Activity Date,Activity Type\n1,"Aug 29, 2026, 1:10:13 AM",Run\n'
+        rec = row_to_record(pd.read_csv(StringIO(csv)).iloc[0])
+        assert rec is not None
+        self.assertEqual(rec.start_date, "2026-08-29T01:10:13+00:00")
+        self.assertEqual(rec.start_date_local, "2026-08-29T01:10:13")
+        self.assertEqual(rec.timezone, "UTC")
+
     def test_missing_csv_raises(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(FileNotFoundError):

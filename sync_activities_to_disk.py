@@ -2,8 +2,16 @@
 """Download full Strava activity history into ``data/activities.jsonl``."""
 
 import argparse
+from datetime import datetime, timezone
 
 from strava_data import ActivityDataService
+
+
+def _parse_since(value: str) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from exc
 
 
 def main() -> None:
@@ -51,11 +59,47 @@ def main() -> None:
         action="store_true",
         help="Fetch newest activities first (recommended with --max-requests)",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Merge into the existing output instead of overwriting it, fetching only "
+        "activities that started after the newest one already in the file",
+    )
+    parser.add_argument(
+        "--since",
+        type=_parse_since,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="With --update: fetch activities that started after this date (UTC) "
+        "instead of after the newest activity in the file",
+    )
     args = parser.parse_args()
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be a positive integer")
     if args.max_requests is not None and args.max_requests <= 0:
         parser.error("--max-requests must be a positive integer")
+    if args.since is not None and not args.update:
+        parser.error("--since requires --update (otherwise the output file is overwritten)")
+    if args.update and (args.smoke_test or args.recent_only):
+        parser.error("--update cannot be combined with --smoke-test or --recent-only")
+
+    if args.update:
+        svc = ActivityDataService()
+        try:
+            added, updated = svc.update_jsonl(
+                args.output,
+                since=args.since,
+                include_map_polyline=args.include_map_polyline,
+                fetch_detail=not args.no_detail,
+                activity_filter="Run" if args.runs_only else None,
+                max_records=args.limit,
+                max_api_requests=args.max_requests,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        tail = f" — {svc._sync_stop_reason}" if svc._sync_stop_reason else ""
+        print(f"Added {added} and updated {updated} activities in {args.output}{tail}")
+        return
 
     output = args.output
     fetch_detail = not args.no_detail

@@ -48,7 +48,7 @@ class ExportCalendarTests(unittest.TestCase):
         records = [_rec(1, mon), _rec(2, tue)]
         rows = build_calendar_rows(records)
         self.assertTrue(any(r[0] == "Day of Week" for r in rows))
-        self.assertTrue(any(r[0] == "Date" and "25-Nov" in r for r in rows))
+        self.assertTrue(any(r[0] == "Date" and "25-Nov-2024" in r for r in rows))
         self.assertTrue(any(r[0] == "Miles" and "5.00" in r for r in rows))
 
     def test_export_xlsx_writes_file(self) -> None:

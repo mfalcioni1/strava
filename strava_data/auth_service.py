@@ -28,9 +28,7 @@ class StravaAuthService:
         )
         print("Go to the following URL to authenticate:")
         print(url)
-        auth_code = input("Enter the authorization code from the URL: ")
-        set_key(self.env_path, "STRAVA_AUTH_CODE", auth_code)
-        return auth_code
+        return input("Enter the authorization code from the URL: ")
 
     def ensure_token_valid(self) -> Client:
         access_token = os.getenv("STRAVA_ACCESS_TOKEN")
@@ -51,11 +49,39 @@ class StravaAuthService:
                 refresh_token=refresh_token,
             )
         else:
-            self.client.access_token = access_token
+            self._configure_client(access_token, refresh_token, expires_at)
             return self.client
 
-        set_key(self.env_path, "STRAVA_ACCESS_TOKEN", token_response["access_token"])
-        set_key(self.env_path, "STRAVA_REFRESH_TOKEN", token_response["refresh_token"])
-        set_key(self.env_path, "STRAVA_EXPIRES_AT", str(token_response["expires_at"]))
-        self.client.access_token = token_response["access_token"]
+        self._configure_client(
+            token_response["access_token"],
+            token_response["refresh_token"],
+            token_response["expires_at"],
+        )
+        self.save_tokens()
         return self.client
+
+    def _configure_client(
+        self,
+        access_token: str | None,
+        refresh_token: str | None,
+        expires_at: str | int | float | None,
+    ) -> None:
+        # With the refresh token and expiry set, stravalib refreshes an access token that
+        # expires mid-run (tokens last 6 hours) instead of failing with 401s.
+        self.client.access_token = access_token
+        self.client.refresh_token = refresh_token
+        self.client.token_expires = int(float(expires_at)) if expires_at else None
+
+    def save_tokens(self) -> None:
+        """Write the client's current tokens to ``.env`` if they changed (e.g. auto-refresh)."""
+        values = {
+            "STRAVA_ACCESS_TOKEN": self.client.access_token,
+            "STRAVA_REFRESH_TOKEN": self.client.refresh_token,
+            "STRAVA_EXPIRES_AT": (
+                str(self.client.token_expires) if self.client.token_expires else None
+            ),
+        }
+        for key, value in values.items():
+            if value and os.getenv(key) != value:
+                set_key(self.env_path, key, value)
+                os.environ[key] = value

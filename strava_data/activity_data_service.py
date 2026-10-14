@@ -13,8 +13,8 @@ from typing import Any, Callable, Iterator, TypeVar
 
 import requests
 from stravalib.client import Client
-from stravalib.exc import Fault, RateLimitExceeded, RateLimitTimeout
-from stravalib.model import Activity
+from stravalib.exc import ApplicationInactive, Fault, RateLimitExceeded, RateLimitTimeout
+from stravalib.model import DetailedActivity, SummaryActivity
 
 from strava_data.auth_service import StravaAuthService
 
@@ -58,8 +58,6 @@ class _RateLimitWindow:
 def _quantity_num(value: Any) -> float | None:
     if value is None:
         return None
-    if hasattr(value, "num"):
-        return float(value.num)
     if isinstance(value, (int, float)):
         return float(value)
     return None
@@ -70,7 +68,24 @@ def _timedelta_seconds(value: Any) -> float | None:
         return None
     if isinstance(value, timedelta):
         return value.total_seconds()
+    # stravalib 2.x Duration is an int subclass holding seconds
+    if isinstance(value, (int, float)):
+        return float(value)
     return None
+
+
+def _timezone_name(value: Any) -> str | None:
+    """IANA name (``America/New_York``) rather than Strava's ``(GMT-05:00) America/New_York``."""
+    if value is None:
+        return None
+    if hasattr(value, "timezone"):
+        try:
+            tz = value.timezone()
+        except Exception:
+            tz = None
+        if tz is not None:
+            return str(tz)
+    return str(value)
 
 
 def _type_label(value: Any) -> str | None:
@@ -148,6 +163,9 @@ class ActivityDataService:
     MAX_RETRIES = 5
     RETRY_BASE_SECONDS = 2.0
     RETRY_MAX_SECONDS = 120.0
+    SHORT_WINDOW_SECONDS = 15 * 60
+    RESET_LAG_SECONDS = 120.0
+    RESET_RETRY_SECONDS = 30.0
 
     def __init__(
         self,
@@ -257,7 +275,14 @@ class ActivityDataService:
             ),
             None,
         )
-        wait_s = self._seconds_until_next_quarter_hour() + random.uniform(0.0, 1.0)
+        until_reset = self._seconds_until_next_quarter_hour()
+        if until_reset > self.SHORT_WINDOW_SECONDS - self.RESET_LAG_SECONDS:
+            # Strava can report the previous window's usage for a short while after the
+            # quarter-hour boundary; a full-window wait here would idle ~15 minutes.
+            wait_s = self.RESET_RETRY_SECONDS
+        else:
+            wait_s = until_reset
+        wait_s += random.uniform(0.0, 1.0)
         detail = ""
         if read_window and read_window.short_limit is not None and read_window.short_usage is not None:
             detail = f" ({read_window.short_usage}/{read_window.short_limit} short-term requests used)"
@@ -275,6 +300,12 @@ class ActivityDataService:
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 result = fn()
+            except ApplicationInactive as exc:
+                raise RuntimeError(
+                    "Strava reports this API application as inactive. Since June 30, 2026 "
+                    "Standard Tier API access requires a Strava subscription; check "
+                    "https://www.strava.com/settings/api"
+                ) from exc
             except Fault as exc:
                 resp = getattr(exc, "response", None)
                 if resp is not None and resp.status_code == 429:
@@ -302,12 +333,17 @@ class ActivityDataService:
         raise RuntimeError(f"Unreachable retry loop for operation: {operation}")
 
     def _fetch_activity_batch(
-        self, before: datetime | None, batch_size: int
-    ) -> list[Activity]:
+        self,
+        before: datetime | None,
+        batch_size: int,
+        after: datetime | None = None,
+    ) -> list[SummaryActivity]:
         page_limit = min(batch_size, STRAVA_MAX_ACTIVITY_PAGE)
 
-        def _fetch() -> list[Activity]:
-            iterator = self.client.get_activities(before=before, limit=page_limit)
+        def _fetch() -> list[SummaryActivity]:
+            iterator = self.client.get_activities(
+                before=before, after=after, limit=page_limit
+            )
             return list(iterator)
 
         return self._call_with_retries("Fetch activity summaries", _fetch)
@@ -323,8 +359,6 @@ class ActivityDataService:
             return value.total_seconds()
         if isinstance(value, Enum):
             return value.value
-        if hasattr(value, "num"):
-            return float(value.num)
         if hasattr(value, "root"):
             return str(value.root)
         return str(value)
@@ -335,7 +369,9 @@ class ActivityDataService:
             self._client = self._auth.ensure_token_valid()
         return self._client
 
-    def iter_all_activity_summaries(self, batch_size: int = 200) -> Iterator[Activity]:
+    def iter_all_activity_summaries(
+        self, batch_size: int = 200
+    ) -> Iterator[SummaryActivity]:
         """Oldest-to-newest iterator over every activity in the token's history."""
         before: datetime | None = None
         page_limit = min(batch_size, STRAVA_MAX_ACTIVITY_PAGE)
@@ -362,7 +398,9 @@ class ActivityDataService:
                 break
             before = oldest - timedelta(seconds=1)
 
-    def iter_recent_activity_summaries(self, batch_size: int = 200) -> Iterator[Activity]:
+    def iter_recent_activity_summaries(
+        self, batch_size: int = 200
+    ) -> Iterator[SummaryActivity]:
         """Newest-first iterator (see :meth:`Client.get_activities`); stops when history ends."""
         before: datetime | None = None
         page_limit = min(batch_size, STRAVA_MAX_ACTIVITY_PAGE)
@@ -388,14 +426,48 @@ class ActivityDataService:
                 break
             before = oldest - timedelta(seconds=1)
 
+    def iter_activity_summaries_after(
+        self, after: datetime, batch_size: int = 200
+    ) -> Iterator[SummaryActivity]:
+        """
+        Oldest-to-newest iterator over activities that started after ``after``.
+
+        Ascending order means a run cut short by the request budget still leaves a
+        contiguous block, so the next incremental update resumes without gaps.
+        """
+        cursor = after if after.tzinfo else after.replace(tzinfo=timezone.utc)
+        page_limit = min(batch_size, STRAVA_MAX_ACTIVITY_PAGE)
+        while True:
+            if not self._can_make_request():
+                self._sync_stop_reason = (
+                    self._sync_stop_reason or "request budget exhausted (list fetch)"
+                )
+                return
+            try:
+                batch = self._fetch_activity_batch(None, batch_size, after=cursor)
+            except ApiQuotaExceeded as exc:
+                self._sync_stop_reason = self._sync_stop_reason or str(exc)
+                return
+            if not batch:
+                break
+            batch.sort(key=lambda a: a.start_date or cursor)
+            for activity in batch:
+                yield activity
+            if len(batch) < page_limit:
+                break
+            newest = batch[-1].start_date
+            if newest is None or newest <= cursor:
+                break
+            cursor = newest
+
     def activity_to_record(
         self,
-        activity: Activity,
+        activity: SummaryActivity | DetailedActivity,
         *,
         include_map_polyline: bool = False,
         fetch_detail: bool = True,
     ) -> ActivityRecord:
-        detail = activity
+        detail: SummaryActivity | DetailedActivity = activity
         got_detail = False
         if fetch_detail and activity.id is not None:
             detail = self._call_with_retries(
@@ -442,7 +514,7 @@ class ActivityDataService:
             type=_type_label(detail.type),
             start_date=start_date_s,
             start_date_local=start_local_s,
-            timezone=_type_label(detail.timezone),
+            timezone=_timezone_name(detail.timezone),
             utc_offset=detail.utc_offset,
             distance_m=distance_m,
             distance_mi=distance_mi,
@@ -520,6 +592,7 @@ class ActivityDataService:
         max_records: int | None = None,
         max_api_requests: int | None = None,
         recent_only: bool = False,
+        after: datetime | None = None,
     ) -> list[ActivityRecord]:
         """
         Pull the complete activity history.
@@ -528,17 +601,45 @@ class ActivityDataService:
 
         ``recent_only`` uses newest-first ordering (best match for "latest N activities").
 
+        ``after`` restricts the pull to activities that started after that instant
+        (oldest-first); ``recent_only`` is ignored when it is set.
+
         ``max_api_requests`` caps successful HTTP calls (list pages + per-activity detail fetches).
         """
+        return list(
+            self.iter_records(
+                include_map_polyline=include_map_polyline,
+                fetch_detail=fetch_detail,
+                activity_filter=activity_filter,
+                max_records=max_records,
+                max_api_requests=max_api_requests,
+                recent_only=recent_only,
+                after=after,
+            )
+        )
+
+    def iter_records(
+        self,
+        *,
+        include_map_polyline: bool = False,
+        fetch_detail: bool = True,
+        activity_filter: str | None = None,
+        max_records: int | None = None,
+        max_api_requests: int | None = None,
+        recent_only: bool = False,
+        after: datetime | None = None,
+    ) -> Iterator[ActivityRecord]:
+        """Streaming form of :meth:`collect_all_records` (same arguments)."""
         self._sync_stop_reason = None
         self._max_api_requests = max_api_requests
         self._api_requests_used = 0
-        records: list[ActivityRecord] = []
-        iterator = (
-            self.iter_recent_activity_summaries()
-            if recent_only
-            else self.iter_all_activity_summaries()
-        )
+        produced = 0
+        if after is not None:
+            iterator = self.iter_activity_summaries_after(after)
+        elif recent_only:
+            iterator = self.iter_recent_activity_summaries()
+        else:
+            iterator = self.iter_all_activity_summaries()
         try:
             for summary in iterator:
                 if activity_filter:
@@ -554,21 +655,22 @@ class ActivityDataService:
                         )
                         break
                 try:
-                    records.append(
-                        self.activity_to_record(
-                            summary,
-                            include_map_polyline=include_map_polyline,
-                            fetch_detail=fetch_detail,
-                        )
+                    record = self.activity_to_record(
+                        summary,
+                        include_map_polyline=include_map_polyline,
+                        fetch_detail=fetch_detail,
                     )
                 except ApiQuotaExceeded as exc:
                     self._sync_stop_reason = self._sync_stop_reason or str(exc)
                     break
-                if max_records is not None and len(records) >= max_records:
+                yield record
+                produced += 1
+                if max_records is not None and produced >= max_records:
                     break
         finally:
             self._max_api_requests = None
-        return records
+            if isinstance(self._auth, StravaAuthService) and self._client is not None:
+                self._auth.save_tokens()
 
     def collect_all_to_jsonl(
         self,
@@ -592,3 +694,136 @@ class ActivityDataService:
         )
         self.save_records_jsonl(records, output_path)
         return len(records)
+
+    @staticmethod
+    def load_jsonl_rows(path: str) -> list[dict[str, Any]]:
+        if not os.path.isfile(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    @staticmethod
+    def latest_start_date(rows: list[dict[str, Any]]) -> datetime | None:
+        latest: datetime | None = None
+        for row in rows:
+            raw = row.get("start_date")
+            if not raw:
+                continue
+            try:
+                dt = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if latest is None or dt > latest:
+                latest = dt
+        return latest
+
+    @classmethod
+    def merge_records_jsonl(
+        cls,
+        records: list[ActivityRecord],
+        path: str,
+    ) -> tuple[int, int]:
+        """
+        Upsert ``records`` into the JSONL at ``path`` by activity id; returns ``(added, updated)``.
+
+        A null in the new record never overwrites an existing value, so fields that only
+        the bulk export provides (weather, source file) survive an API refresh.
+        Output is newest-first and written atomically.
+        """
+        by_id: dict[int, dict[str, Any]] = {}
+        for row in cls.load_jsonl_rows(path):
+            if row.get("id") is not None:
+                by_id[int(row["id"])] = row
+
+        added = updated = 0
+        for rec in records:
+            new_row = json.loads(
+                json.dumps(rec.to_json_dict(), ensure_ascii=False, default=cls._json_default)
+            )
+            old_row = by_id.get(rec.id)
+            if old_row is None:
+                added += 1
+                by_id[rec.id] = new_row
+            else:
+                updated += 1
+                by_id[rec.id] = {
+                    **old_row,
+                    **{k: v for k, v in new_row.items() if v is not None},
+                }
+
+        rows = sorted(
+            by_id.values(),
+            key=lambda r: r.get("start_date") or "",
+            reverse=True,
+        )
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, path)
+        return added, updated
+
+    def update_jsonl(
+        self,
+        output_path: str,
+        *,
+        since: datetime | None = None,
+        include_map_polyline: bool = False,
+        fetch_detail: bool = True,
+        activity_filter: str | None = None,
+        max_records: int | None = None,
+        max_api_requests: int | None = None,
+        checkpoint_every: int = 10,
+    ) -> tuple[int, int]:
+        """
+        Fetch activities that started after ``since`` and merge them into ``output_path``.
+
+        ``since`` defaults to the newest ``start_date`` already in the file, so repeated
+        calls only spend API requests on activities that are new since the last update.
+
+        Records are merged every ``checkpoint_every`` activities, and whatever was fetched
+        is saved if the run stops early (request budget, rate limits, errors, or Ctrl+C).
+        A Ctrl+C is reported through the sync stop reason instead of being re-raised.
+        """
+        if since is None:
+            since = self.latest_start_date(self.load_jsonl_rows(output_path))
+            if since is None:
+                raise ValueError(
+                    f"{output_path} has no activities with a start_date to update from; "
+                    "pass an explicit since date or run a full sync first."
+                )
+        added = updated = 0
+        pending: list[ActivityRecord] = []
+
+        def flush() -> None:
+            nonlocal added, updated
+            if not pending:
+                return
+            new, changed = self.merge_records_jsonl(pending, output_path)
+            added += new
+            updated += changed
+            pending.clear()
+
+        records = self.iter_records(
+            include_map_polyline=include_map_polyline,
+            fetch_detail=fetch_detail,
+            activity_filter=activity_filter,
+            max_records=max_records,
+            max_api_requests=max_api_requests,
+            after=since,
+        )
+        try:
+            for record in records:
+                pending.append(record)
+                if len(pending) >= checkpoint_every:
+                    flush()
+        except KeyboardInterrupt:
+            self._sync_stop_reason = "interrupted (Ctrl+C); re-run --update to resume"
+        finally:
+            flush()
+        return added, updated

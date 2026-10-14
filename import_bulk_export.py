@@ -3,6 +3,9 @@
 
 import argparse
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from tzlocal import get_localzone_name
 
 from strava_data.bulk_export_service import BulkExportService, find_default_source
 
@@ -38,12 +41,24 @@ def main() -> None:
         default=None,
         help="Stop after persisting N matching activities",
     )
+    parser.add_argument(
+        "--timezone",
+        default=None,
+        help="IANA timezone (e.g. America/New_York) for local start times. The export "
+        "records start times in UTC without a per-activity timezone "
+        "(default: this computer's timezone)",
+    )
     args = parser.parse_args()
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be a positive integer")
+    tz_name = args.timezone or get_localzone_name()
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        parser.error(f"unknown timezone {tz_name!r}; use an IANA name like America/New_York")
 
     source = Path(args.source) if args.source else find_default_source()
-    svc = BulkExportService()
+    svc = BulkExportService(default_timezone=tz_name)
     try:
         n = svc.collect_to_jsonl(
             source,
@@ -53,7 +68,7 @@ def main() -> None:
         )
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
-    print(f"Wrote {n} activities to {args.output}")
+    print(f"Wrote {n} activities to {args.output} (local times in {tz_name})")
 
 
 if __name__ == "__main__":
